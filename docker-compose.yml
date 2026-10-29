@@ -1,0 +1,78 @@
+# One-command way to run the whole stack, including a MongoDB replica set
+# (required for the multi-document transactions this project relies on).
+#
+# Usage:
+#   docker compose up --build
+#   -> frontend: http://localhost:5173
+#   -> backend:  http://localhost:8000
+#
+# `mongo-init` runs once, initiates a single-node replica set on the `mongo`
+# service, and exits -- this is the standard local/dev trick for getting
+# transaction support without standing up a multi-node cluster.
+services:
+  mongo:
+    image: mongo:7
+    command: ["--replSet", "rs0", "--bind_ip_all"]
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo_data:/data/db
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+
+  mongo-init:
+    image: mongo:7
+    depends_on:
+      mongo:
+        condition: service_healthy
+    restart: "no"
+    entrypoint:
+      - bash
+      - -c
+      - >
+        mongosh --host mongo:27017 --eval
+        "try { rs.status().ok } catch (e) { rs.initiate({_id:'rs0',members:[{_id:0,host:'mongo:27017'}]}) }"
+
+  backend:
+    build:
+      context: ./backend
+    environment:
+      PORT: 8000
+      MONGO_URI: mongodb://mongo:27017/idempotent_events?replicaSet=rs0
+    ports:
+      - "8000:8000"
+    restart: unless-stopped
+    # Plain (non-conditional) depends_on is used deliberately here instead
+    # of `condition: service_completed_successfully` -- that condition
+    # needs a fairly recent Docker Compose version and silently isn't
+    # supported on older Docker Desktop installs. The backend's own
+    # connectDB() retries with backoff (see src/config/db.js), so correct
+    # startup doesn't actually depend on strict ordering here -- this line
+    # just avoids the container spinning up before the image work starts.
+    depends_on:
+      - mongo
+      - mongo-init
+
+  frontend:
+    build:
+      context: ./frontend
+      args:
+        # The browser fetches the JS bundle from the frontend container, then
+        # makes API calls from the browser itself -- so this URL must be
+        # reachable by the USER'S BROWSER, not by another Docker container.
+        # For a local docker compose stack the backend is on the host's
+        # port 8000, so localhost:8000 is correct here.
+        VITE_API_URL: http://localhost:8000
+    ports:
+      - "5173:5173"
+    restart: unless-stopped
+    depends_on:
+      - backend
+
+volumes:
+  mongo_data:
